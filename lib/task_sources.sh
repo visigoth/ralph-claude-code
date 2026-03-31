@@ -62,15 +62,47 @@ fetch_beads_tasks() {
     # Try to get tasks as JSON
     local json_output
     if json_output=$(bd "${bdArgs[@]}" 2>/dev/null); then
-        # Parse JSON and format as markdown tasks
-        # Note: Use 'select(.status == "closed") | not' to avoid bash escaping issues with '!='
-        # Also filter out entries with missing id or title fields
+        # Parse JSON, linearize leaf tasks by dependency order, then priority, then parent/id
+        # Excludes epics and features (containers) — only actionable task/bug/chore types
         if command -v jq &>/dev/null; then
             tasks=$(echo "$json_output" | jq -r '
-                .[] |
-                select(.status == "closed" | not) |
-                select((.id // "") != "" and (.title // "") != "") |
-                "- [ ] [\(.id)] \(.title)"
+                # Filter to leaf tasks only (exclude epics and features)
+                [.[] | select(.status == "closed" | not) |
+                       select((.id // "") != "" and (.title // "") != "") |
+                       select(.issue_type == "task" or .issue_type == "bug" or .issue_type == "chore")] |
+
+                # Build lookup of all IDs in result set
+                (map(.id) | INDEX(.[]; .)) as $ids |
+
+                # For each task, find blocking deps that are in the result set
+                [.[] | . + {
+                  blocking_deps: [.dependencies // [] | .[] |
+                    select(.type == "blocks") | .depends_on_id |
+                    select(. as $d | $ids | has($d))]
+                }] |
+
+                # Topological sort via iterative layer peeling
+                # Each layer: tasks whose blocking deps are all satisfied
+                # Within a layer: sort by priority (0=highest), parent, id
+                {remaining: ., result: []} |
+                until(.remaining | length == 0;
+                  (.result | map(.id) | INDEX(.[]; .)) as $done |
+                  (.remaining | [.[] | select(
+                    [.blocking_deps[] | select(. as $d | $done | has($d) | not)] | length == 0
+                  )]) as $ready |
+                  if ($ready | length) == 0 then
+                    # Break cycle: take highest-priority remaining task
+                    (.remaining | sort_by(.priority, (.parent // ""), .id) | [.[0]]) as $forced |
+                    {remaining: [.remaining[] | select(.id != $forced[0].id)],
+                     result: (.result + $forced)}
+                  else
+                    ($ready | sort_by(.priority, (.parent // ""), .id)) as $sorted |
+                    ($sorted | map(.id) | INDEX(.[]; .)) as $ready_ids |
+                    {remaining: [.remaining[] | select(.id as $i | $ready_ids | has($i) | not)],
+                     result: (.result + $sorted)}
+                  end
+                ) |
+                .result[] | "- [ ] [\(.id)] \(.title)"
             ' 2>/dev/null || echo "")
         fi
     fi
