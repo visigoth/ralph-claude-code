@@ -67,23 +67,30 @@ fetch_beads_tasks() {
     # Try to get tasks as JSON
     local json_output
     if json_output=$(bd "${bdArgs[@]}" 2>/dev/null); then
-        # Parse JSON, linearize leaf tasks by dependency order, then priority, then parent/id
-        # Excludes epics and features (containers) — only actionable task/bug/chore types
+        # Parse JSON, linearize by dependency order, then priority, then parent/id
+        # Includes all issue types (epics/features represent validation gates)
         if command -v jq &>/dev/null; then
             tasks=$(echo "$json_output" | jq -r '
-                # Filter to leaf tasks only (exclude epics and features)
+                # Filter to valid non-closed tasks (all types)
                 [.[] | select(.status == "closed" | not) |
-                       select((.id // "") != "" and (.title // "") != "") |
-                       select(.issue_type == "task" or .issue_type == "bug" or .issue_type == "chore")] |
+                       select((.id // "") != "" and (.title // "") != "")] |
 
                 # Build lookup of all IDs in result set
                 (map(.id) | INDEX(.[]; .)) as $ids |
 
-                # For each task, find blocking deps that are in the result set
+                # Build reverse parent-child map: parent is blocked by its children
+                (reduce (.[] | .dependencies // [] | .[] |
+                  select(.type == "parent-child")) as $dep
+                  ({}; . + {($dep.depends_on_id):
+                    ((.[$dep.depends_on_id] // []) + [$dep.issue_id])})) as $children_of |
+
+                # For each task, blocking deps = explicit blocks + children (reversed parent-child)
                 [.[] | . + {
-                  blocking_deps: [.dependencies // [] | .[] |
-                    select(.type == "blocks") | .depends_on_id |
-                    select(. as $d | $ids | has($d))]
+                  blocking_deps: (
+                    [.dependencies // [] | .[] | select(.type == "blocks") |
+                      .depends_on_id | select(. as $d | $ids | has($d))] +
+                    [$children_of[.id] // [] | .[] |
+                      select(. as $d | $ids | has($d))])
                 }] |
 
                 # Topological sort via iterative layer peeling
