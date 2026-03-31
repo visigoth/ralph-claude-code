@@ -72,7 +72,7 @@ Usage: ralph enable-ci [OPTIONS]
 Options:
     --from <source>       Import tasks from: beads, github, prd, none
     --prd <file>          PRD file to convert (when --from prd)
-    --label <label>       GitHub label filter (default: ralph-task)
+    --label <label>       Label filter for github or beads (default: ralph-task for github)
     --project-name <name> Override detected project name
     --project-type <type> Override detected type (typescript, python, etc.)
     --force               Overwrite existing .ralph/ configuration
@@ -95,6 +95,9 @@ Examples:
 
     # Enable with beads tasks
     ralph enable-ci --from beads
+
+    # Enable with beads tasks filtered by label
+    ralph enable-ci --from beads --label "my-project"
 
     # Enable with GitHub issues
     ralph enable-ci --from github --label "sprint-1"
@@ -324,7 +327,7 @@ main() {
     local imported_tasks=""
     case "$TASK_SOURCE" in
         beads)
-            if beads_tasks=$(fetch_beads_tasks 2>/dev/null); then
+            if beads_tasks=$(fetch_beads_tasks "open" "$GITHUB_LABEL" 2>/dev/null); then
                 imported_tasks="$beads_tasks"
                 TASKS_IMPORTED=$(echo "$imported_tasks" | grep -c '^\- \[' || echo "0")
                 output_message "Imported $TASKS_IMPORTED tasks from beads"
