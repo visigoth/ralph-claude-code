@@ -40,7 +40,7 @@ detect_questions() {
     # Count lines matching question patterns (case-insensitive)
     for pattern in "${QUESTION_PATTERNS[@]}"; do
         local matches
-        matches=$(echo "$content" | grep -ciw "$pattern" 2>/dev/null || echo "0")
+        matches=$(echo "$content" | grep -ciw "$pattern" 2>/dev/null) || matches=0
         matches=$(echo "$matches" | tr -d '[:space:]')
         matches=${matches:-0}
         question_count=$((question_count + matches))
@@ -524,8 +524,8 @@ analyze_response() {
     local implementation_count=0
     local error_count=0
 
-    test_command_count=$(grep -c -i "running tests\|npm test\|bats\|pytest\|jest" "$output_file" 2>/dev/null | head -1 || echo "0")
-    implementation_count=$(grep -c -i "implementing\|creating\|writing\|adding\|function\|class" "$output_file" 2>/dev/null | head -1 || echo "0")
+    test_command_count=$(grep -c -i "running tests\|npm test\|bats\|pytest\|jest" "$output_file" 2>/dev/null | head -1) || test_command_count=0
+    implementation_count=$(grep -c -i "implementing\|creating\|writing\|adding\|function\|class" "$output_file" 2>/dev/null | head -1) || implementation_count=0
 
     # Strip whitespace and ensure it's a number
     test_command_count=$(echo "$test_command_count" | tr -d '[:space:]')
@@ -726,17 +726,15 @@ update_exit_signals() {
         fi
     fi
 
-    # Update done_signals array
-    if [[ "$has_completion_signal" == "true" ]]; then
-        signals=$(echo "$signals" | jq ".done_signals += [$loop_number]")
-    fi
-
-    # Update completion_indicators array (only when Claude explicitly signals exit)
-    # Note: Previously used confidence >= 60, but JSON mode always has confidence >= 70
-    # due to deterministic scoring (+50 for JSON format, +20 for result field).
-    # This caused premature exits after 5 loops. Now we respect Claude's explicit intent.
+    # Update done_signals and completion_indicators arrays
+    # Both require EXIT_SIGNAL=true — STATUS: COMPLETE with EXIT_SIGNAL: false means
+    # "I finished this task but there's more work to do", not "the project is done".
+    # Without this gate, completing 2 individual tasks would trigger premature exit.
     local exit_signal=$(jq -r '.analysis.exit_signal // false' "$analysis_file")
     if [[ "$exit_signal" == "true" ]]; then
+        if [[ "$has_completion_signal" == "true" ]]; then
+            signals=$(echo "$signals" | jq ".done_signals += [$loop_number]")
+        fi
         signals=$(echo "$signals" | jq ".completion_indicators += [$loop_number]")
     fi
 

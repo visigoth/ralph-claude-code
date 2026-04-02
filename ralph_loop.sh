@@ -616,7 +616,8 @@ wait_for_reset() {
         local seconds=$((wait_time % 60))
         
         printf "\r${YELLOW}Time until reset: %02d:%02d:%02d${NC}" $hours $minutes $seconds
-        sleep 1
+        sleep 1 &
+        wait $! 2>/dev/null || return 130
         ((wait_time--))
     done
     printf "\n"
@@ -711,8 +712,10 @@ should_exit_gracefully() {
     # Fix #144: Only match valid markdown checkboxes, not date entries like [2026-01-29]
     # Valid patterns: "- [ ]" (uncompleted) and "- [x]" or "- [X]" (completed)
     if [[ -f "$RALPH_DIR/fix_plan.md" ]]; then
-        local uncompleted_items=$(grep -cE "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
-        local completed_items=$(grep -cE "^[[:space:]]*- \[[xX]\]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
+        local uncompleted_items
+        uncompleted_items=$(grep -cE "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null) || uncompleted_items=0
+        local completed_items
+        completed_items=$(grep -cE "^[[:space:]]*- \[[xX]\]" "$RALPH_DIR/fix_plan.md" 2>/dev/null) || completed_items=0
         local total_items=$((uncompleted_items + completed_items))
 
         if [[ $total_items -gt 0 ]] && [[ $completed_items -eq $total_items ]]; then
@@ -877,7 +880,8 @@ build_loop_context() {
     # Extract incomplete tasks from fix_plan.md
     # Bug #3 Fix: Support indented markdown checkboxes with [[:space:]]* pattern
     if [[ -f "$RALPH_DIR/fix_plan.md" ]]; then
-        local incomplete_tasks=$(grep -cE "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
+        local incomplete_tasks
+        incomplete_tasks=$(grep -cE "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null) || incomplete_tasks=0
         context+="Remaining tasks: ${incomplete_tasks}. "
     fi
 
@@ -1593,18 +1597,34 @@ execute_claude_code() {
         # on macOS Apple Silicon. Not needed anyway — claude streams per-event,
         # tee is unbuffered, and jq --unbuffered handles its own flushing.
         # Use portable_timeout for consistent timeout protection
-        # stdin redirected from /dev/null: newer Claude CLI reads stdin even in -p mode
+        # stdin must be redirected from /dev/null: newer Claude CLI reads stdin even in -p mode
         # stderr to separate file: prevents Node.js warnings (e.g., UNDICI)
         # from corrupting the jq JSON pipeline (Issue #190)
         local stderr_file="${LOG_DIR}/claude_stderr_$(date '+%Y%m%d_%H%M%S').log"
-        portable_timeout ${timeout_seconds}s "${LIVE_CMD_ARGS[@]}" \
-            < /dev/null 2>"$stderr_file" | tee "$output_file" | jq --unbuffered -j "$jq_filter" 2>/dev/null | tee "$LIVE_LOG_FILE"
 
-        # Capture exit codes from pipeline
-        local -a pipe_status=("${PIPESTATUS[@]}")
+        # Run pipeline in a subshell so ^C can interrupt via our trap handler.
+        # Without this, bash waits for the full pipeline to finish even after SIGINT.
+        # The subshell runs in its own process group, so kill_child_processes() can
+        # terminate the entire pipeline tree (claude + tee + jq + tee).
+        (
+            portable_timeout ${timeout_seconds}s "${LIVE_CMD_ARGS[@]}" \
+                < /dev/null 2>"$stderr_file" | tee "$output_file" | jq --unbuffered -j "$jq_filter" 2>/dev/null | tee "$LIVE_LOG_FILE"
+        ) &
+        local pipeline_pid=$!
 
-        # Primary exit code is from Claude/timeout (first command in pipeline)
-        exit_code=${pipe_status[0]}
+        # Wait for the pipeline subshell — `wait` is interruptible by signals,
+        # so ^C will trigger our trap handler which calls kill_child_processes()
+        wait $pipeline_pid 2>/dev/null
+        exit_code=$?
+
+        # Translate signal-killed exit codes
+        # 128+2=130 (SIGINT), 128+15=143 (SIGTERM)
+        if [[ $exit_code -ge 128 ]]; then
+            # If we received a signal, re-check if it was us who killed it
+            if [[ "${_SIGNAL_RECEIVED:-}" == "true" ]]; then
+                return 130  # Propagate as interrupted
+            fi
+        fi
 
         # Log timeout events explicitly (exit code 124 from portable_timeout)
         if [[ $exit_code -eq 124 ]]; then
@@ -1618,14 +1638,12 @@ execute_claude_code() {
             rm -f "$stderr_file" 2>/dev/null
         fi
 
-        # Check for tee failures (second command) - could break logging/session
-        if [[ ${pipe_status[1]} -ne 0 ]]; then
-            log_status "WARN" "Failed to write stream output to log file (exit code ${pipe_status[1]})"
-        fi
-
-        # Check for jq failures (third command) - warn but don't fail
-        if [[ ${pipe_status[2]} -ne 0 ]]; then
-            log_status "WARN" "jq filter had issues parsing some stream events (exit code ${pipe_status[2]})"
+        # Note: individual pipeline component exit codes (PIPESTATUS) are not
+        # available since the pipeline runs in a subshell for signal handling.
+        # The subshell exit code reflects the last pipeline command's status.
+        # Check output files to detect issues instead.
+        if [[ -f "$output_file" && ! -s "$output_file" ]]; then
+            log_status "WARN" "Stream output file is empty — pipeline may have failed"
         fi
 
         echo ""
@@ -1776,11 +1794,13 @@ EOF
                 fi
             fi
 
-            sleep 10
+            # Use backgrounded sleep so ^C can interrupt via trap
+            sleep 10 &
+            wait $! 2>/dev/null || break
         done
 
         # Wait for the process to finish and get exit code
-        wait $claude_pid
+        wait $claude_pid 2>/dev/null
         exit_code=$?
     fi
 
@@ -2031,6 +2051,11 @@ cleanup() {
     if [[ "$_CLEANUP_DONE" == "true" ]]; then return; fi
     _CLEANUP_DONE=true
 
+    # Kill all child processes in our process group
+    # This handles: live mode pipeline (claude | tee | jq | tee),
+    # background mode (claude &), and any subprocesses they spawned
+    kill_child_processes
+
     # Only record "interrupted" status for abnormal exits (non-zero exit code)
     # Normal exit (code 0) preserves the status already written by the main loop
     if [[ $loop_count -gt 0 && $trap_exit_code -ne 0 ]]; then
@@ -2038,11 +2063,36 @@ cleanup() {
         reset_session "manual_interrupt"
         update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped"
     fi
-    # No exit here — EXIT trap handles natural termination
+
+    # Force exit on signal — without this, bash continues the pipeline/loop
+    # after the trap handler returns
+    if [[ $trap_exit_code -ne 0 ]] || [[ "${_SIGNAL_RECEIVED:-}" == "true" ]]; then
+        exit "${trap_exit_code:-130}"
+    fi
+}
+
+# Kill all child processes recursively
+# Uses pkill -P to walk the process tree from our PID downward
+kill_child_processes() {
+    local my_pid=$$
+
+    # First try SIGTERM for graceful shutdown
+    pkill -TERM -P "$my_pid" 2>/dev/null || true
+
+    # Brief grace period for processes to exit
+    sleep 0.5
+
+    # Then SIGKILL anything still alive
+    pkill -KILL -P "$my_pid" 2>/dev/null || true
+
+    # Also kill any processes in our process group that aren't us
+    # This catches grandchildren that were reparented
+    kill -- -"$my_pid" 2>/dev/null || true
 }
 
 # Set up signal handlers
-trap cleanup SIGINT SIGTERM
+# Use a wrapper that sets a flag so cleanup() knows it was signal-triggered
+trap '_SIGNAL_RECEIVED=true; cleanup' SIGINT SIGTERM
 
 # Global variable for loop count (needed by cleanup function)
 loop_count=0
@@ -2147,6 +2197,14 @@ main() {
     log_status "INFO" "Starting main loop..."
 
     while true; do
+        # Check for graceful stop request (ralph --stop)
+        if [[ -f "$RALPH_DIR/.stop" ]]; then
+            rm -f "$RALPH_DIR/.stop"
+            log_status "INFO" "⏹ Stop requested — exiting gracefully"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "stopped" "stopped" "user_stop"
+            break
+        fi
+
         loop_count=$((loop_count + 1))
 
         # Rotate log if it exceeds 10MB (Issue #18)
@@ -2276,8 +2334,9 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
             send_notification "Ralph - Loop Complete" "Loop #$loop_count completed successfully"
 
-            # Brief pause between successful executions
-            sleep 5
+            # Brief pause between successful executions (interruptible)
+            sleep 5 &
+            wait $! 2>/dev/null || break
         elif [ $exec_result -eq 3 ]; then
             # Circuit breaker opened
             reset_session "circuit_breaker_trip"
@@ -2321,7 +2380,8 @@ main() {
                     local minutes=$((wait_seconds / 60))
                     local seconds=$((wait_seconds % 60))
                     printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
-                    sleep 1
+                    sleep 1 &
+                    wait $! 2>/dev/null || break
                     ((wait_seconds--))
                 done
                 printf "\n"
@@ -2330,7 +2390,8 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
             log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
             send_notification "Ralph - Error" "Claude Code execution failed. Check logs for details."
-            sleep 30
+            sleep 30 &
+            wait $! 2>/dev/null || break
         fi
         
         log_status "LOOP" "=== Completed Loop #$loop_count ==="
@@ -2520,6 +2581,12 @@ while [[ $# -gt 0 ]]; do
             source "$SCRIPT_DIR/lib/date_utils.sh"
             rollback_to_backup "${2:-}"
             exit $?
+            ;;
+        --stop)
+            # Create stop file to gracefully stop the loop after the current iteration
+            touch "$RALPH_DIR/.stop"
+            echo -e "\033[0;33m⏹ Stop requested — Ralph will exit after the current loop completes\033[0m"
+            exit 0
             ;;
         *)
             echo "Unknown option: $1"
