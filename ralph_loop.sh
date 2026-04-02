@@ -1533,20 +1533,55 @@ execute_claude_code() {
         # These are required for stream-json to work properly
         LIVE_CMD_ARGS+=("--verbose" "--include-partial-messages")
 
-        # jq filter: show text + tool names + sub-agent progress + newlines for readability
+        # jq filter: show text + tool summaries + sub-agent progress
+        # Two sources of tool info:
+        #   1. stream_event content_block_start: tool name (arrives at start of streaming)
+        #   2. assistant messages: complete tool inputs (arrive after each turn)
+        # We use assistant messages for tool details since stream deltas are fragments
+        # jq filter overview:
+        #   stream_event text_delta    → text as it streams (real-time)
+        #   stream_event tool_use start→ "⚙ Bash..." (immediate, no args yet)
+        #   assistant message          → "⚡ [Bash] actual command" (after turn, with full args)
+        #   system task_started/progress→ agent status
         local jq_filter='
             if .type == "stream_event" then
                 if .event.type == "content_block_delta" and .event.delta.type == "text_delta" then
                     .event.delta.text
                 elif .event.type == "content_block_start" and .event.content_block.type == "tool_use" then
-                    "\n\n⚡ [" + .event.content_block.name + "]\n"
+                    "\n⚙ " + .event.content_block.name + "..."
                 elif .event.type == "content_block_stop" then
                     "\n"
                 else
                     empty
                 end
+            elif .type == "assistant" then
+                [.message.content[] |
+                    if .type == "tool_use" then
+                        "\n⚡ [" + .name + "] " + (
+                            if .name == "Bash" then
+                                (.input.command // "" | split("\n") | .[0] | .[0:120])
+                            elif .name == "Read" then
+                                (.input.file_path // "")
+                            elif .name == "Write" then
+                                (.input.file_path // "")
+                            elif .name == "Edit" then
+                                (.input.file_path // "")
+                            elif .name == "Glob" then
+                                (.input.pattern // "")
+                            elif .name == "Grep" then
+                                (.input.pattern // "")
+                            elif .name == "Agent" then
+                                (.input.description // "")
+                            else
+                                ""
+                            end
+                        ) + "\n"
+                    else
+                        empty
+                    end
+                ] | join("")
             elif .type == "system" and .subtype == "task_started" then
-                "\n\n🚀 Agent: " + (.description // "started") + "\n"
+                "\n🚀 Agent: " + (.description // "started") + "\n"
             elif .type == "system" and .subtype == "task_progress" then
                 "📌 " + (.description // "working...") + "\n"
             else
