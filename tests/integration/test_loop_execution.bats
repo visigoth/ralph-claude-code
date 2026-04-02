@@ -293,16 +293,22 @@ EOF
     update_exit_signals
     record_loop_result 2 1 "false" 500
 
-    # Loop 3: Completion signal
+    # Loop 3: Completion signal with explicit EXIT_SIGNAL
+    # done_signals only accumulates when EXIT_SIGNAL=true to prevent premature
+    # exits when Claude completes individual tasks but more work remains.
     cat > "$output_file" << 'EOF'
 All tasks complete. Project is finished and ready for review.
+---RALPH_STATUS---
+STATUS: COMPLETE
+EXIT_SIGNAL: true
+---END_RALPH_STATUS---
 EOF
 
     analyze_response "$output_file" 3
     update_exit_signals
     record_loop_result 3 0 "false" 200
 
-    # Check that completion signal was detected
+    # Check that completion signal was detected (requires EXIT_SIGNAL: true)
     local done_signals=$(jq '.done_signals | length' "$EXIT_SIGNALS_FILE")
     [[ "$done_signals" -ge 1 ]]
 }
