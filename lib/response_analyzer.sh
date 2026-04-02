@@ -726,17 +726,15 @@ update_exit_signals() {
         fi
     fi
 
-    # Update done_signals array
-    if [[ "$has_completion_signal" == "true" ]]; then
-        signals=$(echo "$signals" | jq ".done_signals += [$loop_number]")
-    fi
-
-    # Update completion_indicators array (only when Claude explicitly signals exit)
-    # Note: Previously used confidence >= 60, but JSON mode always has confidence >= 70
-    # due to deterministic scoring (+50 for JSON format, +20 for result field).
-    # This caused premature exits after 5 loops. Now we respect Claude's explicit intent.
+    # Update done_signals and completion_indicators arrays
+    # Both require EXIT_SIGNAL=true — STATUS: COMPLETE with EXIT_SIGNAL: false means
+    # "I finished this task but there's more work to do", not "the project is done".
+    # Without this gate, completing 2 individual tasks would trigger premature exit.
     local exit_signal=$(jq -r '.analysis.exit_signal // false' "$analysis_file")
     if [[ "$exit_signal" == "true" ]]; then
+        if [[ "$has_completion_signal" == "true" ]]; then
+            signals=$(echo "$signals" | jq ".done_signals += [$loop_number]")
+        fi
         signals=$(echo "$signals" | jq ".completion_indicators += [$loop_number]")
     fi
 
