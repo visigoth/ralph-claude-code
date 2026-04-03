@@ -62,7 +62,7 @@ Usage: ralph enable [OPTIONS]
 Options:
     --from <source>     Import tasks from: beads, github, prd
     --prd <file>        PRD file to convert (when --from prd)
-    --label <label>     GitHub label filter (when --from github)
+    --label <label>     Label filter (for --from github or --from beads)
     --force             Overwrite existing .ralph/ configuration
     --skip-tasks        Skip task import, use default templates
     --non-interactive   Run with defaults (no prompts)
@@ -76,6 +76,9 @@ Examples:
 
     # Import tasks from beads
     ralph enable --from beads
+
+    # Import from beads with label filter
+    ralph enable --from beads --label "my-project"
 
     # Import from GitHub issues with label
     ralph enable --from github --label "ralph-task"
@@ -237,8 +240,12 @@ phase_environment_detection() {
     echo "Available task sources:"
     if [[ "$DETECTED_BEADS_AVAILABLE" == "true" ]]; then
         local beads_count
-        beads_count=$(get_beads_count 2>/dev/null || echo "0")
-        print_detection_result "beads" "$beads_count open issues" "true"
+        beads_count=$(get_beads_count "$GITHUB_LABEL" 2>/dev/null || echo "0")
+        if [[ -n "$GITHUB_LABEL" ]]; then
+            print_detection_result "beads" "$beads_count open issues (label: $GITHUB_LABEL)" "true"
+        else
+            print_detection_result "beads" "$beads_count open issues" "true"
+        fi
     fi
     if [[ "$DETECTED_GITHUB_AVAILABLE" == "true" ]]; then
         local gh_count
@@ -289,7 +296,7 @@ phase_task_source_selection() {
 
     if [[ "$DETECTED_BEADS_AVAILABLE" == "true" ]]; then
         local beads_count
-        beads_count=$(get_beads_count 2>/dev/null || echo "0")
+        beads_count=$(get_beads_count "$GITHUB_LABEL" 2>/dev/null || echo "0")
         options+=("Import from beads ($beads_count issues)")
         option_keys+=("beads")
     fi
@@ -403,7 +410,7 @@ phase_file_generation() {
 
         if echo "$SELECTED_SOURCES" | grep -qw "beads"; then
             local beads_tasks
-            if beads_tasks=$(fetch_beads_tasks); then
+            if beads_tasks=$(fetch_beads_tasks "open" "$GITHUB_LABEL"); then
                 imported_tasks="${imported_tasks}${beads_tasks}
 "
                 print_success "Imported tasks from beads"

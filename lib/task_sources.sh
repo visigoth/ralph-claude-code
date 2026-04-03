@@ -31,6 +31,7 @@ check_beads_available() {
 #
 # Parameters:
 #   $1 (filterStatus) - Status filter (optional, default: "open")
+#   $2 (label) - Label filter (optional, passed as --label to bd list)
 #
 # Outputs:
 #   Tasks in markdown checkbox format, one per line
@@ -42,6 +43,7 @@ check_beads_available() {
 #
 fetch_beads_tasks() {
     local filterStatus="${1:-open}"
+    local label="${2:-}"
     local tasks=""
 
     # Check if beads is available
@@ -57,6 +59,10 @@ fetch_beads_tasks() {
         bdArgs+=("--status" "in_progress")
     elif [[ "$filterStatus" == "all" ]]; then
         bdArgs+=("--all")
+    fi
+
+    if [[ -n "$label" ]]; then
+        bdArgs+=("--label" "$label")
     fi
 
     # Try to get tasks as JSON
@@ -86,6 +92,9 @@ fetch_beads_tasks() {
         elif [[ "$filterStatus" == "all" ]]; then
             fallbackArgs+=("--all")
         fi
+        if [[ -n "$label" ]]; then
+            fallbackArgs+=("--label" "$label")
+        fi
         tasks=$(bd "${fallbackArgs[@]}" 2>/dev/null | while IFS= read -r line; do
             # Extract ID and title from bd list output
             # Format: "○ cnzb-xxx [● P2] [task] - Title here"
@@ -109,22 +118,32 @@ fetch_beads_tasks() {
 
 # get_beads_count - Get count of open beads issues
 #
+# Parameters:
+#   $1 (label) - Label filter (optional)
+#
 # Returns:
 #   0 and echoes the count
 #   1 if beads unavailable
 #
 get_beads_count() {
+    local label="${1:-}"
+
     if ! check_beads_available; then
         echo "0"
         return 1
     fi
 
+    local bd_args=("list")
+    if [[ -n "$label" ]]; then
+        bd_args+=("--label" "$label")
+    fi
+
     local count
     if command -v jq &>/dev/null; then
         # Note: Use 'select(.status == "closed" | not)' to avoid bash escaping issues with '!='
-        count=$(bd list --json 2>/dev/null | jq '[.[] | select(.status == "closed" | not)] | length' 2>/dev/null || echo "0")
+        count=$(bd "${bd_args[@]}" --json 2>/dev/null | jq '[.[] | select(.status == "closed" | not)] | length' 2>/dev/null || echo "0")
     else
-        count=$(bd list 2>/dev/null | wc -l | tr -d ' ')
+        count=$(bd "${bd_args[@]}" 2>/dev/null | wc -l | tr -d ' ')
     fi
 
     echo "${count:-0}"
@@ -490,6 +509,7 @@ prioritize_tasks() {
 #   $1 (sources) - Space-separated list of sources: beads, github, prd
 #   $2 (prd_file) - Path to PRD file (required if prd in sources)
 #   $3 (github_label) - GitHub label filter (optional)
+#   $4 (beads_label) - Beads label filter (optional)
 #
 # Outputs:
 #   Combined tasks in markdown format
@@ -502,6 +522,7 @@ import_tasks_from_sources() {
     local sources=$1
     local prd_file="${2:-}"
     local github_label="${3:-}"
+    local beads_label="${4:-}"
 
     local all_tasks=""
     local source_count=0
@@ -509,7 +530,7 @@ import_tasks_from_sources() {
     # Import from beads
     if echo "$sources" | grep -qw "beads"; then
         local beads_tasks
-        if beads_tasks=$(fetch_beads_tasks); then
+        if beads_tasks=$(fetch_beads_tasks "open" "$beads_label"); then
             if [[ -n "$beads_tasks" ]]; then
                 all_tasks="${all_tasks}
 # Tasks from beads
