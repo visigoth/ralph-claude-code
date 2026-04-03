@@ -1303,11 +1303,18 @@ build_claude_command() {
     fi
 
     # Add extra flags from CLAUDE_EXTRA_FLAGS (passthrough for arbitrary claude CLI flags)
-    # Example: CLAUDE_EXTRA_FLAGS="--permission-mode bypassPermissions"
+    # Example in .ralphrc: CLAUDE_EXTRA_FLAGS=(--permission-mode bypassPermissions)
+    # Also accepts string form: CLAUDE_EXTRA_FLAGS="--permission-mode bypassPermissions"
     if [[ -n "${CLAUDE_EXTRA_FLAGS:-}" ]]; then
-        local -a extra_flags
-        read -ra extra_flags <<< "$CLAUDE_EXTRA_FLAGS"
-        CLAUDE_CMD_ARGS+=("${extra_flags[@]}")
+        if [[ "$(declare -p CLAUDE_EXTRA_FLAGS 2>/dev/null)" == "declare -a"* ]]; then
+            # Already an array
+            CLAUDE_CMD_ARGS+=("${CLAUDE_EXTRA_FLAGS[@]}")
+        else
+            # String — split on whitespace into array
+            local IFS=' '
+            local -a extra_flags=($CLAUDE_EXTRA_FLAGS)
+            CLAUDE_CMD_ARGS+=("${extra_flags[@]}")
+        fi
     fi
 
     # Read prompt file content and use -p flag
