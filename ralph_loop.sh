@@ -1298,6 +1298,14 @@ build_claude_command() {
         CLAUDE_CMD_ARGS+=("--append-system-prompt" "$loop_context")
     fi
 
+    # Add extra flags from CLAUDE_EXTRA_FLAGS (passthrough for arbitrary claude CLI flags)
+    # Example: CLAUDE_EXTRA_FLAGS="--permission-mode bypassPermissions"
+    if [[ -n "${CLAUDE_EXTRA_FLAGS:-}" ]]; then
+        local -a extra_flags
+        read -ra extra_flags <<< "$CLAUDE_EXTRA_FLAGS"
+        CLAUDE_CMD_ARGS+=("${extra_flags[@]}")
+    fi
+
     # Read prompt file content and use -p flag
     # Note: Claude CLI uses -p for prompts, not --prompt-file (which doesn't exist)
     # Array-based approach maintains shell injection safety
