@@ -1559,22 +1559,41 @@ execute_claude_code() {
             end'
 
         # Execute with streaming, preserving all flags from build_claude_command()
-        # Use stdbuf to disable buffering for real-time output
-        # Use portable_timeout for consistent timeout protection (Issue: missing timeout)
-        # Capture all pipeline exit codes for proper error handling
+        # Use stdbuf to disable buffering for real-time output.
+        # Use portable_timeout for consistent timeout protection.
         # stdin must be redirected from /dev/null because newer Claude CLI versions
-        # read from stdin even in -p (print) mode, causing the process to hang
+        # read from stdin even in -p (print) mode, causing the process to hang.
         # Redirect stderr to separate file to prevent Node.js warnings (e.g., UNDICI)
-        # from corrupting the jq JSON pipeline (Issue #190)
+        # from corrupting the jq JSON pipeline (Issue #190).
         local stderr_file="${LOG_DIR}/claude_stderr_$(date '+%Y%m%d_%H%M%S').log"
-        portable_timeout ${timeout_seconds}s stdbuf -oL "${LIVE_CMD_ARGS[@]}" \
-            < /dev/null 2>"$stderr_file" | stdbuf -oL tee "$output_file" | stdbuf -oL jq --unbuffered -j "$jq_filter" 2>/dev/null | tee "$LIVE_LOG_FILE"
 
-        # Capture exit codes from pipeline
-        local -a pipe_status=("${PIPESTATUS[@]}")
+        # Run the streaming pipeline in a backgrounded subshell so ^C can
+        # interrupt via our trap handler. Without this, bash waits for the
+        # full pipeline to finish before delivering the signal. `wait` on
+        # the pipeline PID is signal-interruptible.
+        #
+        # `set -o pipefail` inside the subshell ensures a non-zero exit
+        # code from any stage (timeout, tee, jq) propagates to the subshell
+        # exit code instead of being masked by the final `tee`.
+        (
+            set -o pipefail
+            portable_timeout ${timeout_seconds}s stdbuf -oL "${LIVE_CMD_ARGS[@]}" \
+                < /dev/null 2>"$stderr_file" \
+                | stdbuf -oL tee "$output_file" \
+                | stdbuf -oL jq --unbuffered -j "$jq_filter" 2>/dev/null \
+                | tee "$LIVE_LOG_FILE"
+        ) &
+        local pipeline_pid=$!
 
-        # Primary exit code is from Claude/timeout (first command in pipeline)
-        exit_code=${pipe_status[0]}
+        # `wait` is interruptible by signals, so ^C will trigger our trap
+        # handler which calls kill_child_processes() to tear down the tree.
+        wait $pipeline_pid 2>/dev/null
+        exit_code=$?
+
+        # If we were signal-killed, propagate as interrupted (130).
+        if [[ $exit_code -ge 128 ]] && [[ "${_SIGNAL_RECEIVED:-}" == "true" ]]; then
+            return 130
+        fi
 
         # Log timeout events explicitly (exit code 124 from portable_timeout)
         if [[ $exit_code -eq 124 ]]; then
@@ -1588,14 +1607,13 @@ execute_claude_code() {
             rm -f "$stderr_file" 2>/dev/null
         fi
 
-        # Check for tee failures (second command) - could break logging/session
-        if [[ ${pipe_status[1]} -ne 0 ]]; then
-            log_status "WARN" "Failed to write stream output to log file (exit code ${pipe_status[1]})"
-        fi
-
-        # Check for jq failures (third command) - warn but don't fail
-        if [[ ${pipe_status[2]} -ne 0 ]]; then
-            log_status "WARN" "jq filter had issues parsing some stream events (exit code ${pipe_status[2]})"
+        # Individual pipeline component exit codes (PIPESTATUS) are not
+        # available since the pipeline runs in a subshell. With `pipefail`
+        # set, the subshell exit code reflects the first failing stage.
+        # Additionally warn if the output capture file is empty, which
+        # indicates an upstream failure before any data was produced.
+        if [[ -f "$output_file" && ! -s "$output_file" ]]; then
+            log_status "WARN" "Stream output file is empty — pipeline may have failed"
         fi
 
         echo ""
