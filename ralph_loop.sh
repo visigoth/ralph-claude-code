@@ -2115,6 +2115,14 @@ main() {
     log_status "INFO" "Starting main loop..."
 
     while true; do
+        # Check for graceful stop request (ralph --stop)
+        if [[ -f "$RALPH_DIR/.stop" ]]; then
+            rm -f "$RALPH_DIR/.stop"
+            log_status "INFO" "⏹ Stop requested — exiting gracefully"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "stopped" "stopped" "user_stop"
+            break
+        fi
+
         loop_count=$((loop_count + 1))
 
         # Rotate log if it exceeds 10MB (Issue #18)
@@ -2488,6 +2496,19 @@ while [[ $# -gt 0 ]]; do
             source "$SCRIPT_DIR/lib/date_utils.sh"
             rollback_to_backup "${2:-}"
             exit $?
+            ;;
+        --stop)
+            # Create stop file to gracefully stop the loop after the current iteration
+            if [[ ! -d "$RALPH_DIR" ]]; then
+                echo "Error: '$RALPH_DIR' not found. Run this from a Ralph project." >&2
+                exit 1
+            fi
+            if ! touch "$RALPH_DIR/.stop" 2>/dev/null; then
+                echo "Error: failed to create '$RALPH_DIR/.stop'" >&2
+                exit 1
+            fi
+            echo -e "\033[0;33m⏹ Stop requested — Ralph will exit after the current loop completes\033[0m"
+            exit 0
             ;;
         *)
             echo "Unknown option: $1"
