@@ -616,7 +616,9 @@ wait_for_reset() {
         local seconds=$((wait_time % 60))
         
         printf "\r${YELLOW}Time until reset: %02d:%02d:%02d${NC}" $hours $minutes $seconds
-        sleep 1
+        # Use backgrounded sleep so ^C can interrupt via trap
+        sleep 1 &
+        wait $! 2>/dev/null || return 130
         ((wait_time--))
     done
     printf "\n"
@@ -1744,11 +1746,13 @@ EOF
                 fi
             fi
 
-            sleep 10
+            # Use backgrounded sleep so ^C can interrupt via trap
+            sleep 10 &
+            wait $! 2>/dev/null || break
         done
 
         # Wait for the process to finish and get exit code
-        wait $claude_pid
+        wait $claude_pid 2>/dev/null
         exit_code=$?
     fi
 
@@ -1999,6 +2003,10 @@ cleanup() {
     if [[ "$_CLEANUP_DONE" == "true" ]]; then return; fi
     _CLEANUP_DONE=true
 
+    # Kill all child processes rooted at this PID.
+    # This handles background-mode (claude &) and any subprocesses they spawned.
+    kill_child_processes
+
     # Only record "interrupted" status for abnormal exits (non-zero exit code)
     # Normal exit (code 0) preserves the status already written by the main loop
     if [[ $loop_count -gt 0 && $trap_exit_code -ne 0 ]]; then
@@ -2006,11 +2014,34 @@ cleanup() {
         reset_session "manual_interrupt"
         update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped"
     fi
-    # No exit here — EXIT trap handles natural termination
+
+    # Force exit on signal — without this, bash continues the pipeline/loop
+    # after the trap handler returns.
+    if [[ $trap_exit_code -ne 0 ]] || [[ "${_SIGNAL_RECEIVED:-}" == "true" ]]; then
+        exit "${trap_exit_code:-130}"
+    fi
+}
+
+# Kill all child processes rooted at this PID.
+# Uses pkill -P to walk the process tree downward from our own PID so we
+# never signal unrelated siblings or the parent shell.
+kill_child_processes() {
+    local my_pid=$$
+
+    # First try SIGTERM for graceful shutdown
+    pkill -TERM -P "$my_pid" 2>/dev/null || true
+
+    # Brief grace period for processes to exit
+    sleep 0.5
+
+    # Then SIGKILL anything still alive
+    pkill -KILL -P "$my_pid" 2>/dev/null || true
 }
 
 # Set up signal handlers
-trap cleanup SIGINT SIGTERM
+# Wrapper sets _SIGNAL_RECEIVED so cleanup() knows it was signal-triggered
+# and should force the script to exit instead of letting bash resume.
+trap '_SIGNAL_RECEIVED=true; cleanup' SIGINT SIGTERM
 
 # Global variable for loop count (needed by cleanup function)
 loop_count=0
@@ -2244,8 +2275,9 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
             send_notification "Ralph - Loop Complete" "Loop #$loop_count completed successfully"
 
-            # Brief pause between successful executions
-            sleep 5
+            # Brief pause between successful executions (interruptible)
+            sleep 5 &
+            wait $! 2>/dev/null || break
         elif [ $exec_result -eq 3 ]; then
             # Circuit breaker opened
             reset_session "circuit_breaker_trip"
@@ -2289,7 +2321,8 @@ main() {
                     local minutes=$((wait_seconds / 60))
                     local seconds=$((wait_seconds % 60))
                     printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
-                    sleep 1
+                    sleep 1 &
+                    wait $! 2>/dev/null || break
                     ((wait_seconds--))
                 done
                 printf "\n"
@@ -2298,7 +2331,8 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
             log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
             send_notification "Ralph - Error" "Claude Code execution failed. Check logs for details."
-            sleep 30
+            sleep 30 &
+            wait $! 2>/dev/null || break
         fi
         
         log_status "LOOP" "=== Completed Loop #$loop_count ==="
